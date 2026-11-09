@@ -1,0 +1,726 @@
+diff --git a/pin_slam.py b/pin_slam.py
+index 2724de7..cd13e71 100644
+--- a/pin_slam.py
++++ b/pin_slam.py
+@@ -244,9 +244,15 @@ def run_pin_slam(
+ 
+         if config.use_dataloader:
+             dataset.read_frame_with_loader(frame_id)
++
++            timestamp = dataset.loader.get_frames_timestamps()[-1]
++
++            print(
++                f"[LOADER-TS] frame={frame_id} "
++                f"timestamp={timestamp:.9f}"
++            )
+         else:
+             dataset.read_frame(frame_id)
+-
+         T1 = get_time()
+         
+         valid_frame = dataset.preprocess_frame()
+@@ -327,6 +333,27 @@ def run_pin_slam(
+                         if not config.silence:
+                             print("[bold green]Refine loop transformation succeed [/bold green]")
+                         pgm.optimize_pose_graph() # conduct pgo
++
++                        timestamps = dataset.loader.get_frames_timestamps()
++
++                        current_ts = timestamps[frame_id]
++                        history_ts = timestamps[loop_id]
++
++                        print(
++                            f"[LOOP-TS] "
++                            f"current={frame_id} ({current_ts:.9f}) "
++                            f"<-> history={loop_id} ({history_ts:.9f})"
++                        )
++
++                        pgm.save_loop_from_gtsam(
++                            cur_id=frame_id,
++                            loop_id=loop_id,
++                            current_points=dataset.cur_source_points,
++                            history_points=neural_points.local_neural_points,
++                            current_time=float(current_ts),
++                            history_time=float(history_ts),
++                        )
++                                                
+                         cur_loop_vis_id = frame_id-config.local_map_context_latency if local_map_context_loop else frame_id
+                         pgm.loop_edges_vis.append(np.array([loop_id, cur_loop_vis_id],dtype=np.uint32)) # only for vis
+                         pgm.loop_edges.append(np.array([loop_id, frame_id],dtype=np.uint32))
+diff --git a/pin_slam_ros.py b/pin_slam_ros.py
+index 8c640d5..b4e5d12 100644
+--- a/pin_slam_ros.py
++++ b/pin_slam_ros.py
+@@ -449,6 +449,14 @@ class PINSLAMer:
+                         reg_valid_flag = self.pgm.add_loop_factor(cur_frame_id, loop_id, loop_transform)
+                     if reg_valid_flag:   
+                         self.pgm.optimize_pose_graph() # conduct pgo
++                        pgm.save_loop_from_gtsam(
++                            cur_id=frame_id,
++                            loop_id=loop_id,
++                            current_points=dataset.cur_source_points,
++                            history_points=neural_points.local_neural_points,
++                            current_time=float(frame_id),
++                            history_time=float(loop_id),
++                        )
+                         cur_loop_vis_id = cur_frame_id-self.config.local_map_context_latency if local_map_context_loop else cur_frame_id
+                         self.pgm.loop_edges.append(np.array([loop_id, cur_loop_vis_id],dtype=np.uint32)) # only for vis
+                         # update the neural points and poses
+diff --git a/utils/pgo.py b/utils/pgo.py
+index 99e5faf..6869e61 100644
+--- a/utils/pgo.py
++++ b/utils/pgo.py
+@@ -10,7 +10,8 @@ import matplotlib.pyplot as plt
+ import numpy as np
+ from numpy.linalg import inv
+ from rich import print
+-
++import csv
++import os
+ from utils.config import Config
+ from utils.tools import get_time
+ 
+@@ -21,6 +22,43 @@ class PoseGraphManager:
+         self.config = config
+         self.silence = config.silence
+ 
++                # =====================================================
++        # LOOP OUTPUT
++        # =====================================================
++
++        self.loop_save_dir = "/output/loop_clouds"
++
++        os.makedirs(
++            self.loop_save_dir,
++            exist_ok=True
++        )
++
++        self.loop_csv_path = os.path.join(
++            self.loop_save_dir,
++            "loop_constraints.csv"
++        )
++
++        if not os.path.exists(self.loop_csv_path):
++            with open(
++                self.loop_csv_path,
++                "w",
++                newline=""
++            ) as f:
++                writer = csv.writer(f)
++
++                writer.writerow([
++                    "current_id",
++                    "history_id",
++                    "current_time",
++                    "history_time",
++                    "tx",
++                    "ty",
++                    "tz",
++                    "roll",
++                    "pitch",
++                    "yaw"
++                ])
++
+         self.fixed_cov = gtsam.noiseModel.Diagonal.Sigmas(
+             np.array([1e-9, 1e-9, 1e-9, 1e-9, 1e-9, 1e-9])
+         )  # fixed
+@@ -187,6 +225,599 @@ class PoseGraphManager:
+             
+         return True
+ 
++    def save_pcd_binary(self, filename, points):
++        if hasattr(points, "detach"):
++            points = (
++                points.detach()
++                .cpu()
++                .numpy()
++            )
++
++        points = np.asarray(points)
++
++        if points.ndim != 2 or points.shape[1] < 3:
++            raise ValueError(
++                f"Invalid point cloud shape: {points.shape}"
++            )
++
++        xyz = points[:, :3].astype(
++            np.float32,
++            copy=False
++        )
++
++        if points.shape[1] >= 4:
++            intensity = points[:, 3].astype(
++                np.float32,
++                copy=False
++            )
++        else:
++            intensity = np.zeros(
++                xyz.shape[0],
++                dtype=np.float32
++            )
++
++        valid = np.isfinite(xyz).all(axis=1)
++
++        xyz = xyz[valid]
++        intensity = intensity[valid]
++
++        if len(xyz) == 0:
++            raise ValueError(
++                f"Empty point cloud: {filename}"
++            )
++
++        data = np.empty(
++            (len(xyz), 4),
++            dtype=np.float32
++        )
++
++        data[:, :3] = xyz
++        data[:, 3] = intensity
++
++        header = (
++            "# .PCD v0.7 - Point Cloud Data file format\n"
++            "VERSION 0.7\n"
++            "FIELDS x y z intensity\n"
++            "SIZE 4 4 4 4\n"
++            "TYPE F F F F\n"
++            "COUNT 1 1 1 1\n"
++            f"WIDTH {len(data)}\n"
++            "HEIGHT 1\n"
++            "VIEWPOINT 0 0 0 1 0 0 0\n"
++            f"POINTS {len(data)}\n"
++            "DATA binary\n"
++        ).encode("ascii")
++
++        os.makedirs(
++            os.path.dirname(filename),
++            exist_ok=True
++        )
++
++        with open(filename, "wb") as f:
++            f.write(header)
++            f.write(data.tobytes())
++
++        print(
++            f"[GTSAM PCD SAVED] "
++            f"{filename} "
++            f"points={len(data)}"
++        )
++    def save_loop_from_gtsam(
++        self,
++        cur_id,
++        loop_id,
++        current_points,
++        history_points,
++        current_time,
++        history_time
++        ):
++            """
++            Zapisuje loop closure na podstawie zoptymalizowanych pozy GTSAM.
++
++            Układ wynikowych PCD:
++                SOURCE -> układ HISTORY
++                TARGET -> układ HISTORY
++
++            GTSAM:
++                T_world_current = T_world<-current
++                T_world_history = T_world<-history
++
++                T_history_current =
++                    inv(T_world_history) @ T_world_current
++
++                T_history_world =
++                    inv(T_world_history)
++            """
++
++            if self.pgo_poses is None:
++                raise RuntimeError(
++                    "pgm.pgo_poses is None. "
++                    "GTSAM PGO nie został jeszcze wykonany."
++                )
++
++            # ============================================================
++            # GTSAM POSES
++            # ============================================================
++
++            T_world_current = np.asarray(
++                self.pgo_poses[cur_id],
++                dtype=np.float64
++            )
++
++            T_world_history = np.asarray(
++                self.pgo_poses[loop_id],
++                dtype=np.float64
++            )
++
++            # ============================================================
++            # TRANSFORMACJA:
++            #
++            # T_history<-current
++            # ============================================================
++
++            T_history_current = (
++                np.linalg.inv(T_world_history)
++                @ T_world_current
++            )
++
++            # ============================================================
++            # TRANSFORMACJA:
++            #
++            # T_history<-world
++            # ============================================================
++
++            T_history_world = np.linalg.inv(
++                T_world_history
++            )
++
++            # ============================================================
++            # CURRENT / SOURCE
++            #
++            # dataset.cur_source_points:
++            # current-local
++            #
++            # wynik:
++            # history-local
++            # ============================================================
++
++            if hasattr(
++                current_points,
++                "detach"
++            ):
++                current_points = (
++                    current_points
++                    .detach()
++                    .cpu()
++                    .numpy()
++                )
++
++            current_points = np.asarray(
++                current_points
++            )
++
++            if (
++                current_points.ndim != 2
++                or current_points.shape[1] < 3
++            ):
++                raise ValueError(
++                    "Invalid current point cloud shape: "
++                    f"{current_points.shape}"
++                )
++
++            current_xyz = (
++                current_points[:, :3]
++                .astype(np.float64)
++            )
++
++            current_xyz_history = (
++                current_xyz
++                @ T_history_current[:3, :3].T
++                + T_history_current[:3, 3]
++            )
++
++            if current_points.shape[1] >= 4:
++                current_intensity = (
++                    current_points[:, 3]
++                    .astype(np.float32)
++                )
++            else:
++                current_intensity = np.zeros(
++                    current_xyz.shape[0],
++                    dtype=np.float32
++                )
++
++            current_cloud = np.column_stack([
++                current_xyz_history,
++                current_intensity
++            ])
++
++            # ============================================================
++            # HISTORY / TARGET
++            #
++            # neural_points.local_neural_points:
++            # WORLD
++            #
++            # wynik:
++            # history-local
++            # ============================================================
++
++            if hasattr(
++                history_points,
++                "detach"
++            ):
++                history_points = (
++                    history_points
++                    .detach()
++                    .cpu()
++                    .numpy()
++                )
++
++            history_points = np.asarray(
++                history_points
++            )
++
++            if (
++                history_points.ndim != 2
++                or history_points.shape[1] < 3
++            ):
++                raise ValueError(
++                    "Invalid history point cloud shape: "
++                    f"{history_points.shape}"
++                )
++
++            history_xyz = (
++                history_points[:, :3]
++                .astype(np.float64)
++            )
++
++            history_xyz_history = (
++                history_xyz
++                @ T_history_world[:3, :3].T
++                + T_history_world[:3, 3]
++            )
++
++            if history_points.shape[1] >= 4:
++                history_intensity = (
++                    history_points[:, 3]
++                    .astype(np.float32)
++                )
++            else:
++                history_intensity = np.zeros(
++                    history_xyz.shape[0],
++                    dtype=np.float32
++                )
++
++            history_cloud = np.column_stack([
++                history_xyz_history,
++                history_intensity
++            ])
++
++            # ============================================================
++            # DEBUG
++            # ============================================================
++
++            print()
++            print(
++                "================ GTSAM LOOP DEBUG ================"
++            )
++
++            print(
++                f"current_id  = {cur_id}"
++            )
++
++            print(
++                f"history_id  = {loop_id}"
++            )
++
++            print(
++                "T_world_current:"
++            )
++            print(
++                T_world_current
++            )
++
++            print(
++                "T_world_history:"
++            )
++            print(
++                T_world_history
++            )
++
++            print(
++                "T_history_current:"
++            )
++            print(
++                T_history_current
++            )
++
++            print(
++                "SOURCE history-frame min:"
++            )
++            print(
++                current_xyz_history.min(axis=0)
++            )
++
++            print(
++                "SOURCE history-frame max:"
++            )
++            print(
++                current_xyz_history.max(axis=0)
++            )
++
++            print(
++                "TARGET history-frame min:"
++            )
++            print(
++                history_xyz_history.min(axis=0)
++            )
++
++            print(
++                "TARGET history-frame max:"
++            )
++            print(
++                history_xyz_history.max(axis=0)
++            )
++
++            print(
++                "=================================================="
++            )
++
++            # ============================================================
++            # CSV
++            #
++            # zapisujemy T_history<-current
++            # ============================================================
++
++            tx = T_history_current[0, 3]
++            ty = T_history_current[1, 3]
++            tz = T_history_current[2, 3]
++
++            pitch = np.arcsin(
++                np.clip(
++                    -T_history_current[2, 0],
++                    -1.0,
++                    1.0
++                )
++            )
++
++            if abs(
++                np.cos(pitch)
++            ) > 1e-6:
++
++                roll = np.arctan2(
++                    T_history_current[2, 1],
++                    T_history_current[2, 2]
++                )
++
++                yaw = np.arctan2(
++                    T_history_current[1, 0],
++                    T_history_current[0, 0]
++                )
++
++            else:
++
++                roll = 0.0
++
++                yaw = np.arctan2(
++                    -T_history_current[0, 1],
++                    T_history_current[1, 1]
++                )
++
++            with open(
++                self.loop_csv_path,
++                "a",
++                newline=""
++            ) as f:
++
++                writer = csv.writer(
++                    f
++                )
++
++                writer.writerow([
++                    cur_id,
++                    loop_id,
++
++                    f"{float(current_time):.20f}",
++                    f"{float(history_time):.20f}",
++
++                    f"{tx:.9f}",
++                    f"{ty:.9f}",
++                    f"{tz:.9f}",
++
++                    f"{roll:.9f}",
++                    f"{pitch:.9f}",
++                    f"{yaw:.9f}",
++                ])
++
++            # ============================================================
++            # PCD PATHS
++            # ============================================================
++
++            current_pcd = os.path.join(
++                self.loop_save_dir,
++                f"loop_{cur_id}_current_{loop_id}.pcd"
++            )
++
++            history_pcd = os.path.join(
++                self.loop_save_dir,
++                f"loop_{cur_id}_history_{loop_id}.pcd"
++            )
++
++            # ============================================================
++            # GLOBAL PCD
++            # ============================================================
++
++            # Folder tworzony tutaj, wewnątrz funkcji
++            global_save_dir = "/output/loop_clouds_global"
++
++            os.makedirs(
++                global_save_dir,
++                exist_ok=True
++            )
++
++            # ============================================================
++            # PCD PATHS
++            # ============================================================
++
++            current_global_pcd = os.path.join(
++                global_save_dir,
++                f"loop_{cur_id}_current_{loop_id}_global.pcd"
++            )
++
++            history_global_pcd = os.path.join(
++                global_save_dir,
++                f"loop_{cur_id}_history_{loop_id}_global.pcd"
++            )
++
++            # ============================================================
++            # CURRENT:
++            #
++            # current_points:
++            #     current-local
++            #
++            # T_world_current:
++            #     WORLD <- CURRENT
++            #
++            # current-local -> WORLD
++            # ============================================================
++
++            current_xyz_global = (
++                current_xyz
++                @ T_world_current[:3, :3].T
++                + T_world_current[:3, 3]
++            )
++
++            current_cloud_global = np.column_stack([
++                current_xyz_global,
++                current_intensity
++            ])
++
++            # ============================================================
++            # HISTORY:
++            #
++            # history_points są już w WORLD
++            #
++            # NIE TRANSFORMUJEMY ICH PONOWNIE
++            # ============================================================
++
++            history_cloud_global = np.column_stack([
++                history_xyz,
++                history_intensity
++            ])
++
++            # ============================================================
++            # SAVE GLOBAL SOURCE
++            # ============================================================
++
++            self.save_pcd_binary(
++                current_global_pcd,
++                current_cloud_global
++            )
++
++            # ============================================================
++            # SAVE GLOBAL TARGET
++            # ============================================================
++
++            self.save_pcd_binary(
++                history_global_pcd,
++                history_cloud_global
++            )
++
++            # ============================================================
++            # DEBUG
++            # ============================================================
++
++            print()
++            print(
++                "================ GLOBAL PCD ================="
++            )
++
++            print(
++                f"[GLOBAL SOURCE] {current_global_pcd}"
++            )
++
++            print(
++                f"[GLOBAL TARGET] {history_global_pcd}"
++            )
++
++            print(
++                "SOURCE WORLD min:"
++            )
++
++            print(
++                current_xyz_global.min(axis=0)
++            )
++
++            print(
++                "SOURCE WORLD max:"
++            )
++
++            print(
++                current_xyz_global.max(axis=0)
++            )
++
++            print(
++                "TARGET WORLD min:"
++            )
++
++            print(
++                history_xyz.min(axis=0)
++            )
++
++            print(
++                "TARGET WORLD max:"
++            )
++
++            print(
++                history_xyz.max(axis=0)
++            )
++
++            print(
++                "=============================================="
++            )
++
++            # ============================================================
++            # SAVE SOURCE
++            # ============================================================
++
++            self.save_pcd_binary(
++                current_pcd,
++                current_cloud
++            )
++
++            # ============================================================
++            # SAVE TARGET
++            # ============================================================
++
++            self.save_pcd_binary(
++                history_pcd,
++                history_cloud
++            )
++
++            print()
++            print(
++                f"[GTSAM LOOP SAVED] "
++                f"current={cur_id} "
++                f"history={loop_id}"
++            )
++
++            print(
++                f"[SOURCE] {current_pcd} "
++                f"points={len(current_cloud)}"
++            )
++
++            print(
++                f"[TARGET] {history_pcd} "
++                f"points={len(history_cloud)}"
++            )
++
++            print()
++
++            return (
++                T_world_current,
++                T_world_history,
++                T_history_current
++            )
+     def optimize_pose_graph(self):
+ 
+         if self.config.pgo_with_isam:

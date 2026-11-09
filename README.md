@@ -26,10 +26,8 @@ own 3D viewer instead of RViz.
 ## Prerequisites
 
 - Docker
-- A GPU is **recommended but not required**: with an NVIDIA GPU and the
-  [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-  installed, the run script uses the GPU automatically; without them it falls
-  back to CPU, which is slower but still completes
+- **NVIDIA GPU + [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)**
+  (PIN-SLAM is PyTorch/CUDA based; CPU-only mode exists but is very slow)
 - A bag containing a `sensor_msgs/PointCloud2` topic
 
 ## Step 1 — Clone with submodules
@@ -42,7 +40,7 @@ cd benchmark-PIN-SLAM-to-HDMapping
 ## Step 2 — Build the Docker image
 
 ```bash
-docker build -t pin-slam_standalone .
+docker build -t pin-slam_cuda .
 ```
 
 This installs:
@@ -64,7 +62,7 @@ Environment variables:
 | `CONFIG` | `config/lidar_slam/run.yaml` | PIN-SLAM config file (inside the PIN_SLAM repo) |
 | `TOPIC` | `/livox/pointcloud` | point cloud topic in the bag |
 | `VIS` | `1` | show PIN-SLAM's live 3D viewer (auto-off without `DISPLAY`) |
-| `CPU_ONLY` | `0` | force CPU; by default the GPU is used when available, otherwise CPU (slower) |
+| `CPU_ONLY` | `0` | force CPU (very slow) |
 | `POINT_SKIP` | `1` | converter keeps every Nth point |
 
 **What happens:**

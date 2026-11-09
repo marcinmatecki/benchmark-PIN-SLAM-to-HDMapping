@@ -125,7 +125,23 @@ def save_laz(path, xyz, intensity, ts_ns):
     las.write(str(path))
     print(f"saved {path} ({xyz.shape[0]} points)")
 
+def get_first_bag_timestamp(bag_path, topic):
+    from rosbags.highlevel import AnyReader
 
+    with AnyReader([Path(bag_path)]) as reader:
+        connections = [c for c in reader.connections if c.topic == topic]
+
+        connection, _, rawdata = next(
+            reader.messages(connections=connections)
+        )
+
+        msg = reader.deserialize(rawdata, connection.msgtype)
+
+        return (
+            msg.header.stamp.sec * 1_000_000_000
+            + msg.header.stamp.nanosec
+        )
+        
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bag", required=True, help="input bag (ROS1 .bag file or ROS2 dir)")
@@ -136,6 +152,21 @@ def main():
     args = ap.parse_args()
 
     poses = load_tum_poses(args.run_dir)
+    pose_ts = np.array([p[0] for p in poses], dtype=np.int64)
+
+    # PIN-SLAM TUM timestamps are relative, bag timestamps are absolute.
+    first_bag_ts = get_first_bag_timestamp(args.bag, args.topic)
+    pose_offset = first_bag_ts - pose_ts[0]
+
+    print(f"[POSE-TS] PIN first = {pose_ts[0] / 1e9:.9f}")
+    print(f"[POSE-TS] BAG first  = {first_bag_ts / 1e9:.9f}")
+    print(f"[POSE-TS] OFFSET     = {pose_offset / 1e9:.9f} s")
+
+    poses = [
+        (ts + pose_offset, T, quat)
+        for ts, T, quat in poses
+    ]
+
     pose_ts = np.array([p[0] for p in poses], dtype=np.int64)
 
     os.makedirs(args.out, exist_ok=True)
@@ -281,6 +312,8 @@ def main():
         json.dump(session, f, indent=2, sort_keys=True)
     print(f"saving file: '{session_path}'")
     print("=== DONE ===")
+
+
 
 
 if __name__ == "__main__":

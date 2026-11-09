@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrandr2 \
     libxinerama1 \
     libxcursor1 \
+    tmux \
     && rm -rf /var/lib/apt/lists/*
 
 # ── PyTorch (CUDA 11.8) ──────────────────────────────────────────────────────
@@ -31,6 +32,30 @@ RUN pip3 install --no-cache-dir torch==2.1.2 --index-url https://download.pytorc
 # ── PIN-SLAM (submodule) + its python dependencies ───────────────────────────
 WORKDIR /pin_ws
 COPY ./src/PIN_SLAM ./PIN_SLAM
+
+COPY ./patches/pin-slam.patch /tmp/pin-slam.patch
+RUN cd /pin_ws/PIN_SLAM && \
+    rm -rf .git && \
+    git apply --verbose /tmp/pin-slam.patch && \
+    rm /tmp/pin-slam.patch
+    
+RUN python3 - <<'PY'
+from pathlib import Path
+
+p = Path("/pin_ws/PIN_SLAM/utils/tools.py")
+s = p.read_text()
+
+s = s.replace(
+'''            git_commit_id = (
+                subprocess.check_output(["git", "rev-parse", "HEAD"]).decode().strip()
+            )  # current git commit
+''',
+'''            git_commit_id = "docker-build"
+'''
+)
+
+p.write_text(s)
+PY
 
 RUN pip3 install --no-cache-dir -r PIN_SLAM/requirements.txt
 
@@ -45,5 +70,11 @@ COPY ./converter/ ./converter/
 RUN python3 -c "import torch; assert torch.cuda.is_available() or True; \
 import open3d, laspy, lazrs, rosbags, gtsam, pypose, pyquaternion; \
 print('[build] PIN-SLAM deps OK, torch', torch.__version__)"
+
+ARG UID=1000
+ARG GID=1000
+RUN groupadd -g $GID ros && \
+    useradd -m -u $UID -g $GID -s /bin/bash ros && \
+    chown -R $UID:$GID /pin_ws
 
 CMD ["bash"]
